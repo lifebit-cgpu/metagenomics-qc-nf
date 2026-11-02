@@ -2,153 +2,105 @@
 /*
  * metagenomics-qc-nf
  * QC for vendor-delivered (e.g. CosmosID) paired-end shotgun metagenomics FASTQ.
- *   FastQC (raw) -> fastp (trimming) -> bowtie2 host depletion (only metagenomic=TRUE)
- *   -> Kraken2 (classified fraction, top taxa, contamination) -> QC summary -> MultiQC
+ *   FastQC (raw) -> fastp trimming -> host-read detection and depletion (only when metagenomic == TRUE)
+ *   -> classified fraction and top taxa (Kraken2 database, or a bowtie2 reference panel)
+ *   -> per-sample QC table with PASS/WARN/FAIL flags -> MultiQC report
  */
 nextflow.enable.dsl = 2
 
-include { MAKE_TEST_DATA } from './modules/local/make_test_data'
-include { FASTQC         } from './modules/local/fastqc'
-include { FASTP          } from './modules/local/fastp'
-include { BOWTIE2_BUILD  } from './modules/local/bowtie2_build'
-include { HOST_DEPLETION } from './modules/local/host_depletion'
-include { KRAKEN2_BUILD  } from './modules/local/kraken2_build'
-include { KRAKEN2        } from './modules/local/kraken2'
-include { QC_SUMMARY     } from './modules/local/qc_summary'
-include { MULTIQC        } from './modules/local/multiqc'
+include { MAKE_TEST_DATA; FASTQC; FASTP; HOST_DEPLETE; CLASSIFY_PANEL; KRAKEN2; QC_SUMMARY; MULTIQC } from './modules.nf'
+include { BOWTIE2_BUILD as BUILD_HOST_INDEX; BOWTIE2_BUILD as BUILD_PANEL_INDEX } from './modules.nf'
 
-def toBool(v) {
-    return v != null && v.toString().trim().toUpperCase() in ['TRUE', 'T', 'YES', 'Y', '1']
-}
-
-def resolvePath(p, base) {
-    def s = p.toString().trim()
-    if (s ==~ /^(s3|gs|az|https?|ftp):\/\/.*/ || s.startsWith('/')) {
-        return file(s, checkIfExists: true)
-    }
-    return file("${base}/${s}", checkIfExists: true)
+def isTrue(v) {
+    return v != null && v.toString().trim().toUpperCase() in ['TRUE', 'T', '1', 'YES', 'Y']
 }
 
 workflow {
-    log.info """
-    metagenomics-qc-nf  v${workflow.manifest.version}
-    ==========================================
-    test_data   : ${params.test_data}
-    input       : ${params.input}
-    host_fasta  : ${params.host_fasta}
-    bowtie2_idx : ${params.bowtie2_index}
-    kraken2_db  : ${params.kraken2_db}
-    outdir      : ${params.outdir}
-    """.stripIndent()
+    def input_desc = params.generate_test_data ? "synthetic test data (seed ${params.test_seed})" : "${params.input}"
+    def host_desc  = params.host_index ?: (params.host_fasta ?: (params.generate_test_data ? 'synthetic host genome' : 'none'))
+    def class_desc = params.kraken2_db ? "kraken2 db ${params.kraken2_db}" : (params.classifier_fasta ? "bowtie2 panel ${params.classifier_fasta}" : (params.generate_test_data ? 'bowtie2 panel (synthetic)' : 'none'))
+    log.info "metagenomics-qc-nf ${workflow.manifest.version} | input: ${input_desc} | host: ${host_desc} | classifier: ${class_desc} | outdir: ${params.outdir}"
 
-    gen_script = file("${projectDir}/scripts/make_synthetic_data.py", checkIfExists: true)
-    qc_script  = file("${projectDir}/scripts/qc_summary.py", checkIfExists: true)
-    mqc_config = file("${projectDir}/assets/multiqc_config.yml", checkIfExists: true)
+    qc_script = file("${projectDir}/bin/qc_summary.py", checkIfExists: true)
 
-    def hostOn   = params.test_data || params.host_fasta || params.bowtie2_index
-    def krakenOn = !params.skip_kraken2 && (params.test_data || params.kraken2_db)
-
-    ch_host_fasta  = Channel.empty()
-    ch_kraken_lib  = Channel.empty()
-    ch_kraken_tax  = Channel.empty()
-
-    if (params.test_data) {
-        // ---- synthetic, deterministic test data generated inside the pipeline ----
-        MAKE_TEST_DATA(gen_script, params.test_seed)
-        ch_meta  = MAKE_TEST_DATA.out.samplesheet
-                        .splitCsv(header: true)
-                        .map { r -> [ r.sample, toBool(r.metagenomic) ] }
-        ch_files = MAKE_TEST_DATA.out.reads
-                        .flatten()
-                        .map { f -> [ f.name.replaceAll(/_R[12]\.fastq\.gz$/, ''), f ] }
-                        .groupTuple(sort: true)
-        ch_reads = ch_meta.join(ch_files)
-                        .map { s, mg, fq -> [ [ id: s, metagenomic: mg ], fq ] }
-        ch_host_fasta = MAKE_TEST_DATA.out.host_fasta
-        ch_kraken_lib = MAKE_TEST_DATA.out.kraken_library
-        ch_kraken_tax = MAKE_TEST_DATA.out.taxonomy
+    if (params.generate_test_data) {
+        MAKE_TEST_DATA(file("${projectDir}/bin/make_test_data.py", checkIfExists: true))
+        ch_files = MAKE_TEST_DATA.out.reads.flatten().map { f -> [f.name, f] }
+        ch_samples = MAKE_TEST_DATA.out.samplesheet
+            .splitCsv(header: true)
+            .map { r -> [r.fastq_1, r] }
+            .join(ch_files)
+            .map { n1, r, f1 -> [r.fastq_2, r, f1] }
+            .join(ch_files)
+            .map { n2, r, f1, f2 -> [[id: r.sample, metagenomic: isTrue(r.metagenomic)], [f1, f2]] }
+        ch_host_fasta  = MAKE_TEST_DATA.out.host
+        ch_panel_fasta = MAKE_TEST_DATA.out.panel
+        ch_truth       = MAKE_TEST_DATA.out.truth
     } else {
         if (!params.input) {
-            error "Provide --input <samplesheet.csv> (columns: sample,fastq_1,fastq_2,metagenomic) or run with -profile test"
+            error "Provide --input samplesheet.csv (columns: sample,fastq_1,fastq_2,metagenomic) or run with -profile test"
         }
-        def base = file(params.input).parent
-        ch_reads = Channel.fromPath(params.input, checkIfExists: true)
-                        .splitCsv(header: true)
-                        .map { r ->
-                            if (!r.sample || !r.fastq_1 || !r.fastq_2) {
-                                error "Samplesheet row is missing sample/fastq_1/fastq_2: ${r}"
-                            }
-                            [ [ id: r.sample.trim(), metagenomic: toBool(r.metagenomic) ],
-                              [ resolvePath(r.fastq_1, base), resolvePath(r.fastq_2, base) ] ]
-                        }
-        if (params.host_fasta) {
-            ch_host_fasta = Channel.value(file(params.host_fasta, checkIfExists: true))
-        }
-        if (!hostOn) {
-            log.warn "No --host_fasta or --bowtie2_index given: host depletion is skipped for ALL samples"
-        }
-        if (!krakenOn) {
-            log.warn "No --kraken2_db given (or --skip_kraken2): classified fraction and top taxa are not computed"
-        }
+        ch_samples = Channel.fromPath(params.input, checkIfExists: true)
+            .splitCsv(header: true)
+            .map { r -> [[id: r.sample, metagenomic: isTrue(r.metagenomic)], [file(r.fastq_1, checkIfExists: true), file(r.fastq_2, checkIfExists: true)]] }
+        ch_host_fasta  = params.host_fasta ? Channel.value(file(params.host_fasta, checkIfExists: true)) : Channel.empty()
+        ch_panel_fasta = params.classifier_fasta ? Channel.value(file(params.classifier_fasta, checkIfExists: true)) : Channel.empty()
+        ch_truth       = Channel.value(file("${projectDir}/assets/NO_FILE", checkIfExists: true))
     }
 
-    // ---------------- QC of raw reads + trimming ----------------
-    FASTQC(ch_reads)
-    FASTP(ch_reads)
+    FASTQC(ch_samples)
+    FASTP(ch_samples)
 
-    // ---------------- host index ----------------
-    if (params.bowtie2_index) {
-        ch_index = Channel.value(file(params.bowtie2_index, checkIfExists: true))
+    // Host-read detection and depletion, only for samples with metagenomic == TRUE
+    if (params.host_index) {
+        ch_host_index = Channel.value(file(params.host_index, type: 'dir', checkIfExists: true))
+    } else if (params.host_fasta || params.generate_test_data) {
+        BUILD_HOST_INDEX(ch_host_fasta.map { f -> ['host', f] })
+        ch_host_index = BUILD_HOST_INDEX.out.index.first()
     } else {
-        BOWTIE2_BUILD(ch_host_fasta)
-        ch_index = BOWTIE2_BUILD.out.index.first()
+        error "Provide --host_index (directory holding a bowtie2 index) or --host_fasta for host-read detection"
     }
 
-    // ---------------- host depletion controlled by the metagenomic flag ----------------
-    ch_trim = FASTP.out.reads.branch { meta, r ->
-        deplete: hostOn && meta.metagenomic
+    ch_trimmed = FASTP.out.reads.branch { meta, reads ->
+        host: meta.metagenomic
         skip: true
     }
-    HOST_DEPLETION(ch_trim.deplete, ch_index)
-    ch_clean = HOST_DEPLETION.out.reads.mix(ch_trim.skip)
+    HOST_DEPLETE(ch_trimmed.host, ch_host_index)
+    ch_clean = HOST_DEPLETE.out.reads.mix(ch_trimmed.skip)
 
-    // ---------------- taxonomic classification ----------------
-    ch_kraken_reports = Channel.empty()
-    if (krakenOn) {
-        if (params.kraken2_db) {
-            ch_kraken_db = Channel.value(file(params.kraken2_db, checkIfExists: true))
-        } else {
-            KRAKEN2_BUILD(ch_kraken_lib, ch_kraken_tax)
-            ch_kraken_db = KRAKEN2_BUILD.out.db.first()
-        }
-        KRAKEN2(ch_clean, ch_kraken_db)
-        ch_kraken_reports = KRAKEN2.out.report.map { it[1] }
+    // Classified fraction and top taxa
+    ch_class = Channel.empty()
+    if (params.kraken2_db) {
+        KRAKEN2(ch_clean, Channel.value(file(params.kraken2_db, type: 'dir', checkIfExists: true)))
+        ch_class = KRAKEN2.out.report
+    } else if (params.classifier_fasta || params.generate_test_data) {
+        BUILD_PANEL_INDEX(ch_panel_fasta.map { f -> ['panel', f] })
+        CLASSIFY_PANEL(ch_clean, BUILD_PANEL_INDEX.out.index.first())
+        ch_class = CLASSIFY_PANEL.out.counts.mix(CLASSIFY_PANEL.out.log)
+    } else {
+        log.warn "No --kraken2_db or --classifier_fasta given: classified fraction and top taxa will be NA"
     }
 
-    // ---------------- per-sample QC summary ----------------
-    ch_samples = ch_reads
-                    .map { m, r -> "${m.id},${m.metagenomic}" }
-                    .collectFile(name: 'samples.csv', newLine: true, sort: true)
+    ch_sample_list = ch_samples
+        .map { meta, reads -> "${meta.id},${meta.metagenomic}".toString() }
+        .collectFile(name: 'samples.csv', newLine: true, sort: true)
 
     QC_SUMMARY(
         qc_script,
-        ch_samples,
-        FASTP.out.json.map { it[1] }.collect(),
-        HOST_DEPLETION.out.stats.map { it[1] }.collect().ifEmpty([]),
-        ch_kraken_reports.collect().ifEmpty([])
+        ch_sample_list,
+        FASTP.out.json.collect(),
+        HOST_DEPLETE.out.counts.collect().ifEmpty([]),
+        ch_class.collect().ifEmpty([]),
+        ch_truth
     )
 
-    // ---------------- MultiQC ----------------
-    ch_mqc = FASTQC.out.zip.map { it[1] }
-                .mix(FASTP.out.json.map { it[1] })
-                .mix(HOST_DEPLETION.out.log.map { it[1] })
-                .mix(ch_kraken_reports)
-                .mix(QC_SUMMARY.out.mqc)
-                .flatten()
-                .collect()
-    MULTIQC(ch_mqc, mqc_config)
+    MULTIQC(
+        FASTQC.out.zip
+            .mix(FASTP.out.json, HOST_DEPLETE.out.log, QC_SUMMARY.out.mqc)
+            .collect()
+    )
 }
 
 workflow.onComplete {
-    log.info "Pipeline finished: ${workflow.success ? 'SUCCESS' : 'FAILED'} | duration ${workflow.duration} | results in ${params.outdir}"
+    log.info "metagenomics-qc-nf ${workflow.success ? 'completed successfully' : 'FAILED'}; results in ${params.outdir}"
 }
