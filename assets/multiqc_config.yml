@@ -1,0 +1,14 @@
+title: "Metagenomics QC (vendor FASTQ)"
+report_comment: >
+  Lifebit metagenomics QC: FastQC on raw reads, fastp trimming, bowtie2 host depletion
+  (only samples with metagenomic=TRUE), Kraken2 classification. The 'Lifebit QC summary'
+  table gives raw pairs, retention, host fraction, classified fraction, contamination and top taxa per sample.
+custom_content:
+  order:
+    - qc_summary
+    - read_fate
+extra_fn_clean_exts:
+  - ".kraken2.report"
+  - ".fastp"
+  - ".bowtie2"
+  - "_trimmed"
