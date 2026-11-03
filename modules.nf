@@ -104,9 +104,9 @@ process HOST_DEPLETE {
     path "${meta.id}.host_counts.tsv",  emit: counts
 
     script:
+    // Index prefix = the single *.rev.1.bt2[l] file in the index directory, minus its suffix
     """
-    set -o pipefail
-    INDEX=\$(ls ${index}/*.1.bt2* | grep -v '\\.rev\\.' | head -n 1 | sed -E 's/\\.1\\.bt2l?\$//')
+    INDEX=\$(ls ${index}/*.rev.1.bt2* | sed -E 's/\\.rev\\.1\\.bt2l?\$//')
     bowtie2 -p ${task.cpus} --sensitive -x \$INDEX \\
         -1 ${reads[0]} -2 ${reads[1]} \\
         --un-conc-gz ${meta.id}_nohost_%.fastq.gz \\
@@ -138,8 +138,8 @@ process CLASSIFY_PANEL {
     script:
     // Read 1 of each (host-depleted) pair is aligned to the reference panel; FASTA headers are "<taxon>|<contig>"
     """
+    INDEX=\$(ls ${index}/*.rev.1.bt2* | sed -E 's/\\.rev\\.1\\.bt2l?\$//')
     set -o pipefail
-    INDEX=\$(ls ${index}/*.1.bt2* | grep -v '\\.rev\\.' | head -n 1 | sed -E 's/\\.1\\.bt2l?\$//')
     bowtie2 -p ${task.cpus} --sensitive -x \$INDEX -U ${reads[0]} \\
         --no-unal --no-hd 2> ${meta.id}.panel.bowtie2.log \\
       | cut -f 3 | sort | uniq -c \\

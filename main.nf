@@ -56,7 +56,7 @@ workflow {
         ch_host_index = Channel.value(file(params.host_index, type: 'dir', checkIfExists: true))
     } else if (params.host_fasta || params.generate_test_data) {
         BUILD_HOST_INDEX(ch_host_fasta.map { f -> ['host', f] })
-        ch_host_index = BUILD_HOST_INDEX.out.index.first()
+        ch_host_index = BUILD_HOST_INDEX.out.index
     } else {
         error "Provide --host_index (directory holding a bowtie2 index) or --host_fasta for host-read detection"
     }
@@ -75,7 +75,7 @@ workflow {
         ch_class = KRAKEN2.out.report
     } else if (params.classifier_fasta || params.generate_test_data) {
         BUILD_PANEL_INDEX(ch_panel_fasta.map { f -> ['panel', f] })
-        CLASSIFY_PANEL(ch_clean, BUILD_PANEL_INDEX.out.index.first())
+        CLASSIFY_PANEL(ch_clean, BUILD_PANEL_INDEX.out.index)
         ch_class = CLASSIFY_PANEL.out.counts.mix(CLASSIFY_PANEL.out.log)
     } else {
         log.warn "No --kraken2_db or --classifier_fasta given: classified fraction and top taxa will be NA"
